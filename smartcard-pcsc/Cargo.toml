@@ -1,0 +1,9 @@
+[package]
+name = "smartcard-pcsc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pcsc.workspace = true
+smartcard-apdu.workspace = true
+smartcard-core.workspace = true

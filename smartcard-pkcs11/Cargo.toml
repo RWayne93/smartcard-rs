@@ -1,0 +1,15 @@
+[package]
+name = "smartcard-pkcs11"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sha2.workspace = true
+smartcard-core.workspace = true
+smartcard-pcsc.workspace = true
+smartcard-piv.workspace = true
+smartcard-worker.workspace = true
+x509-parser.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "smartcard-piv"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rsa.workspace = true
+smartcard-apdu.workspace = true
+sha2.workspace = true
+x509-parser.workspace = true

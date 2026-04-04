@@ -1,0 +1,12 @@
+[package]
+name = "smartcard-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sha2.workspace = true
+smartcard-apdu.workspace = true
+smartcard-core.workspace = true
+smartcard-pcsc.workspace = true
+smartcard-piv.workspace = true
+smartcard-worker.workspace = true

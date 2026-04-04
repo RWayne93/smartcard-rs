@@ -1,0 +1,7 @@
+[package]
+name = "smartcard-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+smartcard-apdu.workspace = true

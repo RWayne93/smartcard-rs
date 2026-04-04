@@ -1,0 +1,8 @@
+[package]
+name = "smartcard-worker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+smartcard-apdu.workspace = true
+smartcard-core.workspace = true

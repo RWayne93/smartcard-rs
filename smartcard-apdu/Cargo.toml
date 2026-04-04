@@ -1,0 +1,6 @@
+[package]
+name = "smartcard-apdu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
