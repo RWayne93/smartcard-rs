@@ -30,14 +30,16 @@ pub type ObjectHandle = u64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderConfig {
     pub command_timeout: Duration,
-    pub cache_ttl: Duration,
+    pub reader_poll_interval: Duration,
+    pub token_cache_ttl: Duration,
 }
 
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             command_timeout: Duration::from_secs(10),
-            cache_ttl: Duration::from_secs(30),
+            reader_poll_interval: Duration::from_secs(2),
+            token_cache_ttl: Duration::from_secs(60),
         }
     }
 }
@@ -262,12 +264,23 @@ pub struct Session {
     pub active_sign: Option<SignContext>,
     pub find_results: Vec<ObjectHandle>,
     pub find_position: usize,
+    pub cached_find_template: Option<FindTemplateKey>,
+    pub cached_find_results: Vec<ObjectHandle>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignContext {
     pub mechanism: Mechanism,
     pub key_handle: ObjectHandle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FindTemplateKey(pub Vec<FindTemplatePredicate>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FindTemplatePredicate {
+    pub type_: CkAttributeType,
+    pub value: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -552,6 +565,15 @@ impl Provider {
             object_handles: object_handles.clone(),
         });
 
+        for session in self.sessions.values_mut() {
+            if session.slot_id == slot_id {
+                session.find_results.clear();
+                session.find_position = 0;
+                session.cached_find_template = None;
+                session.cached_find_results.clear();
+            }
+        }
+
         Ok(object_handles)
     }
 
@@ -577,6 +599,8 @@ impl Provider {
                 session.active_sign = None;
                 session.find_results.clear();
                 session.find_position = 0;
+                session.cached_find_template = None;
+                session.cached_find_results.clear();
             }
         }
 
@@ -609,6 +633,8 @@ impl Provider {
                 active_sign: None,
                 find_results: Vec::new(),
                 find_position: 0,
+                cached_find_template: None,
+                cached_find_results: Vec::new(),
             },
         );
         Ok(handle)
@@ -661,6 +687,8 @@ impl Provider {
                 session.active_sign = None;
                 session.find_results.clear();
                 session.find_position = 0;
+                session.cached_find_template = None;
+                session.cached_find_results.clear();
             }
         }
         Ok(())
@@ -809,6 +837,34 @@ impl Provider {
         Ok(())
     }
 
+    pub fn cached_find_results(
+        &self,
+        handle: SessionHandle,
+        template: &FindTemplateKey,
+    ) -> Result<Option<Vec<ObjectHandle>>, ProviderError> {
+        let session = self
+            .sessions
+            .get(&handle)
+            .ok_or(ProviderError::SessionNotFound(handle))?;
+        Ok((session.cached_find_template.as_ref() == Some(template))
+            .then(|| session.cached_find_results.clone()))
+    }
+
+    pub fn cache_find_results(
+        &mut self,
+        handle: SessionHandle,
+        template: FindTemplateKey,
+        results: Vec<ObjectHandle>,
+    ) -> Result<(), ProviderError> {
+        let session = self
+            .sessions
+            .get_mut(&handle)
+            .ok_or(ProviderError::SessionNotFound(handle))?;
+        session.cached_find_template = Some(template);
+        session.cached_find_results = results;
+        Ok(())
+    }
+
     pub fn next_find_results(
         &mut self,
         handle: SessionHandle,
@@ -904,6 +960,9 @@ struct ModuleLifecycle {
 struct ModuleState {
     runtime: Option<SmartcardRuntime>,
     provider: Provider,
+    workers: HashMap<String, ReaderWorker>,
+    last_reader_refresh: Option<Instant>,
+    last_token_refreshes: HashMap<SlotId, Instant>,
 }
 
 impl ModuleState {
@@ -911,35 +970,83 @@ impl ModuleState {
         let mut state = Self {
             runtime: None,
             provider: Provider::new(ProviderConfig::default()),
+            workers: HashMap::new(),
+            last_reader_refresh: None,
+            last_token_refreshes: HashMap::new(),
         };
         let _ = state.refresh_slots();
         state
     }
 
     fn refresh_slots(&mut self) -> Result<(), SmartcardError> {
-        let Some(runtime) = self.ensure_runtime() else {
+        if self.ensure_runtime().is_none() {
             self.provider.sync_readers(&[]);
+            self.workers.clear();
+            self.last_reader_refresh = Some(Instant::now());
+            self.last_token_refreshes.clear();
             return Ok(());
-        };
+        }
 
-        let readers = runtime.list_readers()?;
-        self.provider.sync_readers(&readers);
+        let reader_poll_interval = self.provider.config.reader_poll_interval;
+        let token_cache_ttl = self.provider.config.token_cache_ttl;
+        let reader_refresh_due = self
+            .last_reader_refresh
+            .is_none_or(|last_refresh| last_refresh.elapsed() >= reader_poll_interval);
+
+        if reader_refresh_due {
+            let runtime = self.runtime_for_io()?;
+            let readers = runtime.list_readers()?;
+            self.provider.sync_readers(&readers);
+
+            let known_readers: HashSet<String> =
+                readers.into_iter().map(|reader| reader.name).collect();
+            self.workers
+                .retain(|reader_name, _| known_readers.contains(reader_name));
+            self.last_token_refreshes
+                .retain(|slot_id, _| self.provider.slot(*slot_id).is_some());
+            self.last_reader_refresh = Some(Instant::now());
+        }
 
         for slot_id in self.provider.slot_ids(false) {
             let Some(slot) = self.provider.slot(slot_id) else {
                 continue;
             };
+            let token_present = slot.token.is_some();
+            let token_refresh_due =
+                self.last_token_refreshes
+                    .get(&slot_id)
+                    .is_none_or(|last_refresh| {
+                        let ttl = if token_present {
+                            token_cache_ttl
+                        } else {
+                            reader_poll_interval
+                        };
+                        last_refresh.elapsed() >= ttl
+                    });
+            if !token_refresh_due {
+                continue;
+            }
+
             let reader_name = slot.reader.name.clone();
-            match self.inspect_piv_token(&reader_name) {
-                Ok(Some((token, objects))) => {
-                    let _ = self.provider.publish_token(slot_id, token, objects);
+            if token_present {
+                match self.probe_piv_token(&reader_name) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        let _ = self.provider.clear_token(slot_id);
+                    }
                 }
-                Ok(None) | Err(_) => {
-                    let _ = self.provider.clear_token(slot_id);
+            } else {
+                match self.inspect_piv_token(&reader_name) {
+                    Ok(Some((token, objects))) => {
+                        let _ = self.provider.publish_token(slot_id, token, objects);
+                    }
+                    Ok(None) | Err(_) => {
+                        let _ = self.provider.clear_token(slot_id);
+                    }
                 }
             }
+            self.last_token_refreshes.insert(slot_id, Instant::now());
         }
-
         Ok(())
     }
 
@@ -952,14 +1059,11 @@ impl ModuleState {
     }
 
     fn inspect_piv_token(
-        &self,
+        &mut self,
         reader_name: &str,
     ) -> Result<Option<(TokenTemplate, Vec<ObjectTemplate>)>, SmartcardError> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| SmartcardError::transport("PC/SC runtime is unavailable"))?;
-        let worker = self.open_worker(reader_name)?;
+        let runtime = self.runtime_for_io()?;
+        let worker = self.worker_for_reader(reader_name)?;
         let response =
             runtime.exchange(select_piv_application(), |command| worker.transmit(command))?;
 
@@ -1022,7 +1126,6 @@ impl ModuleState {
         if objects.is_empty() {
             return Ok(None);
         }
-
         Ok(Some((
             TokenTemplate {
                 label: select.label.unwrap_or_else(|| "PIV Token".to_owned()),
@@ -1036,29 +1139,58 @@ impl ModuleState {
         )))
     }
 
-    fn open_worker(&self, reader_name: &str) -> Result<ReaderWorker, SmartcardError> {
+    fn probe_piv_token(&mut self, reader_name: &str) -> Result<bool, SmartcardError> {
+        let runtime = self.runtime_for_io()?;
+        let worker = self.worker_for_reader(reader_name)?;
+        let response =
+            runtime.exchange(select_piv_application(), |command| worker.transmit(command))?;
+        Ok(response.status_word() == 0x9000)
+    }
+
+    fn runtime_for_io(&self) -> Result<SmartcardRuntime, SmartcardError> {
         let runtime = self
             .runtime
             .as_ref()
             .ok_or_else(|| SmartcardError::transport("PC/SC runtime is unavailable"))?;
-        ReaderWorker::start(
+        Ok(SmartcardRuntime::from_shared(
             runtime.transport(),
-            reader_name.to_owned(),
-            runtime.config().connect_timeout,
-            self.provider.config.command_timeout,
-            runtime.config().slow_call_threshold,
-        )
+            runtime.config().clone(),
+        ))
     }
 
-    fn verify_pin_on_card(&self, reader_name: &str, pin: &str) -> Result<VerifyPinStatus, CkRv> {
+    fn worker_for_reader(&mut self, reader_name: &str) -> Result<&ReaderWorker, SmartcardError> {
+        if !self.workers.contains_key(reader_name) {
+            let runtime = self.runtime_for_io()?;
+            let worker = ReaderWorker::start(
+                runtime.transport(),
+                reader_name.to_owned(),
+                runtime.config().connect_timeout,
+                self.provider.config.command_timeout,
+                runtime.config().slow_call_threshold,
+            )?;
+            self.workers.insert(reader_name.to_owned(), worker);
+        }
+
+        self.workers.get(reader_name).ok_or_else(|| {
+            SmartcardError::transport(format!("reader worker for {reader_name:?} is unavailable"))
+        })
+    }
+
+    fn verify_pin_on_card(
+        &mut self,
+        reader_name: &str,
+        pin: &str,
+    ) -> Result<VerifyPinStatus, CkRv> {
         let started = Instant::now();
         trace(format!(
             "verify_pin_on_card reader={reader_name:?} pin_len={}",
             pin.len()
         ));
-        let runtime = self.runtime.as_ref().ok_or(CKR_DEVICE_ERROR)?;
-        let worker = self.open_worker(reader_name).map_err(map_smartcard_error)?;
-        ensure_piv_selected(runtime, &worker)?;
+        let runtime = self.runtime_for_io().map_err(map_smartcard_error)?;
+        let worker = self
+            .worker_for_reader(reader_name)
+            .map_err(map_smartcard_error)?;
+        ensure_piv_selected(&runtime, worker)?;
         let command = verify_pin_command(pin).map_err(map_piv_error)?;
         let response = runtime
             .exchange(command, |apdu| worker.transmit(apdu))
@@ -1072,9 +1204,10 @@ impl ModuleState {
     }
 
     fn sign_with_piv(
-        &self,
+        &mut self,
         reader_name: &str,
         certificate_slot: CertificateSlot,
+        algorithm: SignAlgorithm,
         mechanism: Mechanism,
         data: &[u8],
         pin: &str,
@@ -1085,23 +1218,14 @@ impl ModuleState {
             certificate_slot.key_reference,
             data.len()
         ));
-        let runtime = self.runtime.as_ref().ok_or(CKR_DEVICE_ERROR)?;
-        let worker = self.open_worker(reader_name).map_err(map_smartcard_error)?;
-        ensure_piv_selected(runtime, &worker)?;
-
-        let response = runtime
-            .exchange(read_certificate_command(certificate_slot), |apdu| {
-                worker.transmit(apdu)
-            })
+        let runtime = self.runtime_for_io().map_err(map_smartcard_error)?;
+        let worker = self
+            .worker_for_reader(reader_name)
             .map_err(map_smartcard_error)?;
-        let certificate = parse_certificate_response(certificate_slot, &response)
-            .map_err(map_piv_error)?
-            .ok_or(CKR_KEY_HANDLE_INVALID)?;
-        let algorithm = infer_sign_algorithm(&certificate).map_err(map_piv_error)?;
+        ensure_piv_selected(&runtime, worker)?;
         trace(format!(
-            "sign_with_piv slot={:02X} algorithm={algorithm:?} cert_len={}",
+            "sign_with_piv slot={:02X} algorithm={algorithm:?}",
             certificate_slot.key_reference,
-            certificate.der.len()
         ));
 
         let signing_input = match mechanism {
@@ -1112,7 +1236,7 @@ impl ModuleState {
             Mechanism::RsaPkcs => prepare_raw_rsa_pkcs1_v1_5_input(algorithm, data)?,
         };
 
-        match self.verify_pin_on_existing_worker(&worker, pin)? {
+        match Self::verify_pin_on_existing_worker(&runtime, worker, pin)? {
             VerifyPinStatus::Verified => {}
             VerifyPinStatus::Incorrect { .. } => return Err(CKR_PIN_INCORRECT),
             VerifyPinStatus::Blocked => return Err(CKR_PIN_LOCKED),
@@ -1177,12 +1301,11 @@ impl ModuleState {
     }
 
     fn verify_pin_on_existing_worker(
-        &self,
+        runtime: &SmartcardRuntime,
         worker: &ReaderWorker,
         pin: &str,
     ) -> Result<VerifyPinStatus, CkRv> {
         let started = Instant::now();
-        let runtime = self.runtime.as_ref().ok_or(CKR_DEVICE_ERROR)?;
         let command = verify_pin_command(pin).map_err(map_piv_error)?;
         let response = runtime
             .exchange(command, |apdu| worker.transmit(apdu))
@@ -1419,6 +1542,21 @@ fn private_key_descriptor(algorithm: SignAlgorithm) -> Option<(KeyType, usize)> 
     }
 }
 
+fn sign_algorithm_for_private_key(
+    key_type: KeyType,
+    key_size_bits: usize,
+) -> Option<SignAlgorithm> {
+    match (key_type, key_size_bits) {
+        (KeyType::Rsa, 1024) => Some(SignAlgorithm::Rsa1024),
+        (KeyType::Rsa, 2048) => Some(SignAlgorithm::Rsa2048),
+        (KeyType::Rsa, 3072) => Some(SignAlgorithm::Rsa3072),
+        (KeyType::Rsa, 4096) => Some(SignAlgorithm::Rsa4096),
+        (KeyType::Ec, 256) => Some(SignAlgorithm::EccP256),
+        (KeyType::Ec, 384) => Some(SignAlgorithm::EccP384),
+        _ => None,
+    }
+}
+
 fn ensure_piv_selected(runtime: &SmartcardRuntime, worker: &ReaderWorker) -> Result<(), CkRv> {
     let response = runtime
         .exchange(select_piv_application(), |apdu| worker.transmit(apdu))
@@ -1535,6 +1673,17 @@ fn populate_padded(destination: &mut [u8], value: &[u8]) {
     destination.fill(b' ');
     let count = value.len().min(destination.len());
     destination[..count].copy_from_slice(&value[..count]);
+}
+
+fn build_find_template_key(attributes: &[CkAttribute]) -> Result<FindTemplateKey, CkRv> {
+    let mut predicates = Vec::with_capacity(attributes.len());
+    for attribute in attributes {
+        predicates.push(FindTemplatePredicate {
+            type_: attribute.type_,
+            value: unsafe { attribute_value_bytes(attribute)? }.to_vec(),
+        });
+    }
+    Ok(FindTemplateKey(predicates))
 }
 
 fn object_matches_template(object: &ObjectRecord, attribute: &CkAttribute) -> Result<bool, CkRv> {
@@ -2167,10 +2316,6 @@ pub unsafe extern "C" fn C_FindObjectsInit(
     count: CkUlong,
 ) -> CkRv {
     match with_module(|module| {
-        let handles = module
-            .provider
-            .list_objects(session as SessionHandle, None)
-            .map_err(map_provider_error)?;
         let attributes = if template.is_null() {
             if count == 0 {
                 &[][..]
@@ -2180,6 +2325,23 @@ pub unsafe extern "C" fn C_FindObjectsInit(
         } else {
             unsafe { slice::from_raw_parts(template.cast::<CkAttribute>(), count as usize) }
         };
+        let template_key = build_find_template_key(attributes)?;
+
+        if let Some(results) = module
+            .provider
+            .cached_find_results(session as SessionHandle, &template_key)
+            .map_err(map_provider_error)?
+        {
+            return module
+                .provider
+                .set_find_results(session as SessionHandle, results)
+                .map_err(map_provider_error);
+        }
+
+        let handles = module
+            .provider
+            .list_objects(session as SessionHandle, None)
+            .map_err(map_provider_error)?;
 
         let mut results = Vec::new();
         'objects: for handle in handles {
@@ -2194,6 +2356,10 @@ pub unsafe extern "C" fn C_FindObjectsInit(
             }
             results.push(handle);
         }
+        module
+            .provider
+            .cache_find_results(session as SessionHandle, template_key, results.clone())
+            .map_err(map_provider_error)?;
 
         module
             .provider
@@ -2555,14 +2721,17 @@ pub unsafe extern "C" fn C_Sign(
             .provider
             .object(active_sign.key_handle)
             .ok_or(CKR_KEY_HANDLE_INVALID)?;
-        let (key_reference, key_size_bits) = match object.data {
+        let (key_reference, key_type, key_size_bits) = match object.data {
             ObjectData::PrivateKey {
+                key_type,
                 key_reference,
                 key_size_bits,
                 ..
-            } => (key_reference, key_size_bits),
+            } => (key_reference, key_type, key_size_bits),
             ObjectData::Certificate { .. } => return Err(CKR_KEY_HANDLE_INVALID),
         };
+        let algorithm = sign_algorithm_for_private_key(key_type, key_size_bits)
+            .ok_or(CKR_KEY_TYPE_INCONSISTENT)?;
 
         let expected_len = (key_size_bits / 8) as CkUlong;
         let caller_len = unsafe { *signature_len };
@@ -2585,6 +2754,7 @@ pub unsafe extern "C" fn C_Sign(
         let signature_bytes = module.sign_with_piv(
             &reader_name,
             certificate_slot,
+            algorithm,
             active_sign.mechanism,
             input,
             &pin,
@@ -2623,10 +2793,10 @@ pub unsafe extern "C" fn C_Sign(
 #[cfg(test)]
 mod tests {
     use super::{
-        CertificateAttributes, KeyType, Mechanism, ObjectClass, ObjectData, ObjectRecord,
-        ObjectTemplate, Provider, ProviderConfig, ProviderError, ProviderStatus, SessionState,
-        TokenTemplate, UserType, der_encode_integer, encode_bool, encode_ulong,
-        object_matches_template, parse_certificate_attributes,
+        CertificateAttributes, FindTemplateKey, FindTemplatePredicate, KeyType, Mechanism,
+        ObjectClass, ObjectData, ObjectRecord, ObjectTemplate, Provider, ProviderConfig,
+        ProviderError, ProviderStatus, SessionState, TokenTemplate, UserType, der_encode_integer,
+        encode_bool, encode_ulong, object_matches_template, parse_certificate_attributes,
     };
     use crate::abi::{
         CKA_CERTIFICATE_TYPE, CKA_CLASS, CKA_ID, CKA_ISSUER, CKA_MODULUS, CKA_PUBLIC_EXPONENT,
@@ -3049,5 +3219,68 @@ mod tests {
         assert!(object_matches_template(&object, &modulus_attr).unwrap());
         assert!(object_matches_template(&object, &exponent_attr).unwrap());
         assert!(object_matches_template(&object, &sign_attr).unwrap());
+    }
+
+    #[test]
+    fn find_result_cache_is_reused_for_identical_templates() {
+        let mut provider = Provider::new(ProviderConfig::default());
+        provider.sync_readers(&[reader("Reader A")]);
+        let slot_id = provider.slot_for_reader("Reader A").unwrap();
+        provider
+            .publish_token(
+                slot_id,
+                token_template(),
+                [
+                    ObjectTemplate::certificate(
+                        "PIV Authentication",
+                        [0x9A],
+                        sample_certificate_der(),
+                    ),
+                    ObjectTemplate::private_key(
+                        "PIV Authentication",
+                        [0x9A],
+                        KeyType::Rsa,
+                        0x9A,
+                        1024,
+                        false,
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let session = provider.open_session(slot_id).unwrap();
+        let template = FindTemplateKey(vec![
+            FindTemplatePredicate {
+                type_: CKA_TOKEN,
+                value: encode_bool(true).to_vec(),
+            },
+            FindTemplatePredicate {
+                type_: CKA_CLASS,
+                value: encode_ulong(CKO_CERTIFICATE),
+            },
+        ]);
+        let expected = provider
+            .list_objects(session, Some(ObjectClass::Certificate))
+            .unwrap();
+
+        assert_eq!(
+            provider.cached_find_results(session, &template).unwrap(),
+            None
+        );
+
+        provider
+            .cache_find_results(session, template.clone(), expected.clone())
+            .unwrap();
+
+        assert_eq!(
+            provider.cached_find_results(session, &template).unwrap(),
+            Some(expected.clone())
+        );
+
+        provider.clear_token(slot_id).unwrap();
+        assert_eq!(
+            provider.cached_find_results(session, &template).unwrap(),
+            None
+        );
     }
 }
