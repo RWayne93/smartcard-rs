@@ -113,6 +113,16 @@ pub struct CkMechanismInfo {
     pub flags: CkFlags,
 }
 
+pub type CkRsaPkcsMgfType = CkUlong;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CkRsaPkcsPssParams {
+    pub hash_alg: CkMechanismType,
+    pub mgf: CkRsaPkcsMgfType,
+    pub s_len: CkUlong,
+}
+
 #[repr(C)]
 pub struct CkFunctionList {
     pub version: CkVersion,
@@ -244,14 +254,22 @@ pub const CKS_RO_USER_FUNCTIONS: CkState = 1;
 pub const CKS_RW_PUBLIC_SESSION: CkState = 2;
 pub const CKS_RW_USER_FUNCTIONS: CkState = 3;
 
+pub const CKO_VENDOR_DEFINED: CkObjectClass = 0x8000_0000;
 pub const CKO_CERTIFICATE: CkObjectClass = 0x0000_0001;
+pub const CKO_PUBLIC_KEY: CkObjectClass = 0x0000_0002;
 pub const CKO_PRIVATE_KEY: CkObjectClass = 0x0000_0003;
+pub const CKO_PROFILE: CkObjectClass = 0x0000_0009;
+pub const NSSCK_VENDOR_NSS: CkUlong = 0x4E53_4350;
+pub const CKO_NSS: CkObjectClass = CKO_VENDOR_DEFINED | NSSCK_VENDOR_NSS;
+pub const CKO_NSS_TRUST: CkObjectClass = CKO_NSS + 3;
+pub const CKO_NETSCAPE_TRUST: CkObjectClass = CKO_NSS_TRUST;
 
 pub const CKK_RSA: CkKeyType = 0x0000_0000;
 pub const CKK_EC: CkKeyType = 0x0000_0003;
 
 pub const CKC_X_509: CkCertificateType = 0x0000_0000;
 
+pub const CKA_VENDOR_DEFINED: CkAttributeType = 0x8000_0000;
 pub const CKA_CLASS: CkAttributeType = 0x0000_0000;
 pub const CKA_TOKEN: CkAttributeType = 0x0000_0001;
 pub const CKA_PRIVATE: CkAttributeType = 0x0000_0002;
@@ -263,11 +281,50 @@ pub const CKA_SERIAL_NUMBER: CkAttributeType = 0x0000_0082;
 pub const CKA_KEY_TYPE: CkAttributeType = 0x0000_0100;
 pub const CKA_SUBJECT: CkAttributeType = 0x0000_0101;
 pub const CKA_ID: CkAttributeType = 0x0000_0102;
+pub const CKA_ENCRYPT: CkAttributeType = 0x0000_0104;
 pub const CKA_SIGN: CkAttributeType = 0x0000_0108;
+pub const CKA_VERIFY: CkAttributeType = 0x0000_010A;
 pub const CKA_MODULUS: CkAttributeType = 0x0000_0120;
 pub const CKA_MODULUS_BITS: CkAttributeType = 0x0000_0121;
 pub const CKA_PUBLIC_EXPONENT: CkAttributeType = 0x0000_0122;
 pub const CKA_ALWAYS_AUTHENTICATE: CkAttributeType = 0x0000_0202;
+pub const CKA_PROFILE_ID: CkAttributeType = 0x0000_0601;
+pub const CKA_NSS: CkAttributeType = CKA_VENDOR_DEFINED | NSSCK_VENDOR_NSS;
+pub const CKA_TRUST: CkAttributeType = CKA_NSS + 0x2000;
+pub const CKA_TRUST_DIGITAL_SIGNATURE: CkAttributeType = CKA_TRUST + 1;
+pub const CKA_TRUST_NON_REPUDIATION: CkAttributeType = CKA_TRUST + 2;
+pub const CKA_TRUST_KEY_ENCIPHERMENT: CkAttributeType = CKA_TRUST + 3;
+pub const CKA_TRUST_DATA_ENCIPHERMENT: CkAttributeType = CKA_TRUST + 4;
+pub const CKA_TRUST_KEY_AGREEMENT: CkAttributeType = CKA_TRUST + 5;
+pub const CKA_TRUST_KEY_CERT_SIGN: CkAttributeType = CKA_TRUST + 6;
+pub const CKA_TRUST_CRL_SIGN: CkAttributeType = CKA_TRUST + 7;
+pub const CKA_TRUST_SERVER_AUTH: CkAttributeType = CKA_TRUST + 8;
+pub const CKA_TRUST_CLIENT_AUTH: CkAttributeType = CKA_TRUST + 9;
+pub const CKA_TRUST_CODE_SIGNING: CkAttributeType = CKA_TRUST + 10;
+pub const CKA_TRUST_EMAIL_PROTECTION: CkAttributeType = CKA_TRUST + 11;
+pub const CKA_TRUST_IPSEC_END_SYSTEM: CkAttributeType = CKA_TRUST + 12;
+pub const CKA_TRUST_IPSEC_TUNNEL: CkAttributeType = CKA_TRUST + 13;
+pub const CKA_TRUST_IPSEC_USER: CkAttributeType = CKA_TRUST + 14;
+pub const CKA_TRUST_TIME_STAMPING: CkAttributeType = CKA_TRUST + 15;
+pub const CKA_TRUST_STEP_UP_APPROVED: CkAttributeType = CKA_TRUST + 16;
+pub const CKA_CERT_SHA1_HASH: CkAttributeType = CKA_TRUST + 100;
+pub const CKA_CERT_MD5_HASH: CkAttributeType = CKA_TRUST + 101;
+
+pub const CKT_VENDOR_DEFINED: CkUlong = 0x8000_0000;
+pub const CKT_NSS: CkUlong = CKT_VENDOR_DEFINED | NSSCK_VENDOR_NSS;
+pub const CKT_NSS_TRUSTED: CkUlong = CKT_NSS + 1;
+pub const CKT_NSS_TRUSTED_DELEGATOR: CkUlong = CKT_NSS + 2;
+pub const CKT_NSS_MUST_VERIFY_TRUST: CkUlong = CKT_NSS + 3;
+pub const CKT_NSS_TRUST_UNKNOWN: CkUlong = CKT_NSS + 5;
+pub const CKT_NSS_NOT_TRUSTED: CkUlong = CKT_NSS + 10;
+pub const CKT_NSS_VALID_DELEGATOR: CkUlong = CKT_NSS + 11;
+
+pub const CKP_AUTHENTICATION_TOKEN: CkUlong = 0x0000_0003;
+pub const CKP_PUBLIC_CERTIFICATES_TOKEN: CkUlong = 0x0000_0004;
 
 pub const CKM_RSA_PKCS: CkMechanismType = 0x0000_0001;
+pub const CKM_RSA_PKCS_PSS: CkMechanismType = 0x0000_000D;
 pub const CKM_SHA256_RSA_PKCS: CkMechanismType = 0x0000_0040;
+pub const CKM_SHA256_RSA_PKCS_PSS: CkMechanismType = 0x0000_0043;
+pub const CKM_SHA256: CkMechanismType = 0x0000_0250;
+pub const CKG_MGF1_SHA256: CkRsaPkcsMgfType = 0x0000_0002;

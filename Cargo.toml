@@ -16,8 +16,10 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+md5 = { package = "md-5", version = "0.10" }
 pcsc = "2.9"
 rsa = "0.9"
+sha1 = "0.10"
 sha2 = { version = "0.10", features = ["oid"] }
 smartcard-apdu = { path = "smartcard-apdu" }
 smartcard-core = { path = "smartcard-core" }

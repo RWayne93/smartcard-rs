@@ -7,6 +7,8 @@ edition.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+md5.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 smartcard-core.workspace = true
 smartcard-pcsc.workspace = true
