@@ -72,9 +72,9 @@ impl CardSession for PcscSession {
         let encoded = command
             .encode()
             .map_err(|error| SmartcardError::protocol(error.to_string()))?;
-        let tx = self.card.transaction().map_err(map_pcsc_error)?;
         let mut rapdu_buf = [0; MAX_BUFFER_SIZE];
-        let rapdu = tx
+        let rapdu = self
+            .card
             .transmit(&encoded, &mut rapdu_buf)
             .map_err(map_pcsc_error)?;
         ResponseApdu::from_bytes(rapdu).map_err(map_apdu_error)

@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use smartcard_apdu::{CommandApdu, ResponseApdu};
 use smartcard_core::{ReaderHealth, ReaderInfo, Result, SharedTransport, SmartcardError};
 
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct ReaderWorker {
     request_tx: Sender<WorkerRequest>,
     state: Arc<Mutex<ReaderInfo>>,
@@ -133,29 +135,58 @@ fn worker_main(
     slow_call_threshold: Duration,
 ) {
     let started = Instant::now();
-    let mut session = match transport.connect(&reader) {
-        Ok(session) => session,
+    match transport.connect(&reader) {
+        Ok(session) => {
+            let health = ReaderHealth::from_elapsed(started.elapsed(), slow_call_threshold);
+            if let Ok(mut snapshot) = state.lock() {
+                snapshot.health = health;
+                snapshot.atr = session.atr().map(|atr| atr.to_vec());
+            }
+            drop(session);
+            let _ = ready_tx.send(Ok(()));
+        }
         Err(error) => {
             set_health(&state, ReaderHealth::Unresponsive);
             let _ = ready_tx.send(Err(error));
             return;
         }
-    };
-
-    let health = ReaderHealth::from_elapsed(started.elapsed(), slow_call_threshold);
-    if let Ok(mut snapshot) = state.lock() {
-        snapshot.health = health;
-        snapshot.atr = session.atr().map(|atr| atr.to_vec());
     }
-    let _ = ready_tx.send(Ok(()));
 
-    while let Ok(request) = request_rx.recv() {
+    let mut session: Option<Box<dyn smartcard_core::CardSession>> = None;
+
+    loop {
+        let request = if session.is_some() {
+            match request_rx.recv_timeout(SESSION_IDLE_TIMEOUT) {
+                Ok(req) => req,
+                Err(RecvTimeoutError::Timeout) => {
+                    session = None;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match request_rx.recv() {
+                Ok(req) => req,
+                Err(_) => break,
+            }
+        };
+
         match request {
             WorkerRequest::Transmit {
                 command,
                 response_tx,
             } => {
-                let _ = response_tx.send(session.transmit(&command));
+                if session.is_none() {
+                    session = transport.connect(&reader).ok();
+                }
+                let result = match session.as_mut() {
+                    Some(s) => s.transmit(&command),
+                    None => Err(SmartcardError::transport("failed to connect to card")),
+                };
+                if result.is_err() {
+                    session = None;
+                }
+                let _ = response_tx.send(result);
             }
             WorkerRequest::Shutdown => break,
         }
