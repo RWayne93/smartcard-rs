@@ -12,10 +12,10 @@ use crate::provider::{
     ProviderStatus, SessionState, TokenTemplate, TrustAttributes, UserType,
 };
 use crate::util::{
-    der_encode_integer, encode_bool, encode_ulong, object_matches_template,
+    der_encode_integer, derive_token_metadata, encode_bool, encode_ulong, object_matches_template,
     parse_certificate_attributes, prepare_sha256_rsa_pss_input,
 };
-use smartcard_piv::SignAlgorithm;
+use smartcard_piv::{PRIMARY_CERTIFICATE_SLOTS, SignAlgorithm};
 
 fn reader(name: &str) -> ReaderInfo {
     ReaderInfo::new(name).with_health(ReaderHealth::Healthy)
@@ -34,6 +34,22 @@ fn token_template() -> TokenTemplate {
             Mechanism::Sha256RsaPkcsPss,
         ],
     }
+}
+
+#[test]
+fn derive_token_metadata_prefers_certificate_identity_over_applet_identity() {
+    let certificate = sample_certificate_der();
+    let metadata = derive_token_metadata(
+        &[(PRIMARY_CERTIFICATE_SLOTS[0], certificate)],
+        Some("HID Global ActivID Applet 2.7.4"),
+        &[0x3B, 0xD8, 0x18, 0x00, 0x80, 0x1F, 0x07, 0x80],
+        "Reader A",
+    );
+
+    assert_eq!(metadata.label, "test-piv");
+    assert_eq!(metadata.manufacturer, "piv_II");
+    assert_eq!(metadata.model, "PKCS#15 emulated");
+    assert_eq!(metadata.serial_number, "3BD81800801F0780");
 }
 
 fn sample_certificate_der() -> Vec<u8> {

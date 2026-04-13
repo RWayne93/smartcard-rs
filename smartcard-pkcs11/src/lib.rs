@@ -173,6 +173,7 @@ impl ModuleState {
 
         let mut objects = Vec::new();
         let mut mechanisms = Vec::new();
+        let mut token_certificates = Vec::new();
 
         for slot in PRIMARY_CERTIFICATE_SLOTS {
             let response = runtime.exchange(read_certificate_command(slot), |command| {
@@ -193,6 +194,7 @@ impl ModuleState {
                 certificate.der.len()
             ));
             let attributes = parse_certificate_attributes(&certificate.der)?;
+            token_certificates.push((slot, certificate.der.clone()));
 
             let object_id = vec![slot.key_reference];
             objects.push(ObjectTemplate::certificate_with_attributes(
@@ -255,12 +257,18 @@ impl ModuleState {
             select.label.as_deref().unwrap_or("PIV Token"),
             objects.len()
         ));
+        let token_metadata = derive_token_metadata(
+            &token_certificates,
+            select.label.as_deref(),
+            &atr,
+            reader_name,
+        );
         Ok(Some((
             TokenTemplate {
-                label: select.label.unwrap_or_else(|| "PIV Token".to_owned()),
-                manufacturer: "smartcard-rs".to_owned(),
-                model: "PIV".to_owned(),
-                serial_number: token_serial(&atr, reader_name),
+                label: token_metadata.label,
+                manufacturer: token_metadata.manufacturer,
+                model: token_metadata.model,
+                serial_number: token_metadata.serial_number,
                 login_required: true,
                 mechanisms,
             },

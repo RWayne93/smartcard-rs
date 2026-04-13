@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use smartcard_core::{SmartcardError, SmartcardRuntime};
 use smartcard_piv::{CertificateSlot, PRIMARY_CERTIFICATE_SLOTS, PivError, SignAlgorithm};
 use smartcard_worker::ReaderWorker;
+use x509_parser::oid_registry::OID_X509_SERIALNUMBER;
 use x509_parser::pem::Pem;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use x509_parser::public_key::PublicKey;
@@ -71,6 +72,97 @@ pub(crate) fn token_serial(atr: &[u8], reader_name: &str) -> String {
         serial.push(' ');
     }
     serial
+}
+
+pub(crate) struct TokenMetadata {
+    pub(crate) label: String,
+    pub(crate) manufacturer: String,
+    pub(crate) model: String,
+    pub(crate) serial_number: String,
+}
+
+pub(crate) fn derive_token_metadata(
+    certificates: &[(CertificateSlot, Vec<u8>)],
+    select_label: Option<&str>,
+    atr: &[u8],
+    reader_name: &str,
+) -> TokenMetadata {
+    let label = certificates
+        .iter()
+        .find(|(slot, _)| slot.key_reference == 0x9A)
+        .and_then(|(_, der)| certificate_common_name(der))
+        .or_else(|| {
+            certificates
+                .iter()
+                .find_map(|(_, der)| certificate_common_name(der))
+        })
+        .or_else(|| {
+            select_label
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "PIV Token".to_owned());
+
+    let serial_number = certificates
+        .iter()
+        .find(|(slot, _)| slot.key_reference == 0x9E)
+        .and_then(|(_, der)| certificate_subject_serial_number(der))
+        .or_else(|| {
+            certificates
+                .iter()
+                .find_map(|(_, der)| certificate_subject_serial_number(der))
+        })
+        .unwrap_or_else(|| token_serial(atr, reader_name));
+
+    TokenMetadata {
+        label,
+        // OpenSC presents PIV tokens this way to NSS/modutil. Matching that
+        // shape produces more accurate and interoperable token URIs than using
+        // the module vendor name here.
+        manufacturer: "piv_II".to_owned(),
+        model: "PKCS#15 emulated".to_owned(),
+        serial_number,
+    }
+}
+
+fn certificate_common_name(der: &[u8]) -> Option<String> {
+    let (_, parsed) = X509Certificate::from_der(der).ok()?;
+    parsed
+        .subject()
+        .iter_common_name()
+        .find_map(|name| name.as_str().ok())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn certificate_subject_serial_number(der: &[u8]) -> Option<String> {
+    let (_, parsed) = X509Certificate::from_der(der).ok()?;
+    let value = parsed
+        .subject()
+        .iter_by_oid(&OID_X509_SERIALNUMBER)
+        .find_map(|attribute| attribute.as_str().ok())?;
+    normalize_token_identifier(value)
+}
+
+fn normalize_token_identifier(value: &str) -> Option<String> {
+    let mut normalized: String = value
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect();
+    if normalized.is_empty() {
+        normalized = value
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect();
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    normalized.make_ascii_lowercase();
+    normalized.truncate(16);
+    Some(normalized)
 }
 
 fn hex_upper(bytes: &[u8]) -> String {
