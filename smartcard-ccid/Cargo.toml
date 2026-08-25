@@ -1,0 +1,9 @@
+[package]
+name = "smartcard-ccid"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pcsc-rs = { path = "../../pcsc-rs" }
+smartcard-apdu.workspace = true
+smartcard-core.workspace = true
