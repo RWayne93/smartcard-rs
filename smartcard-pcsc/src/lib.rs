@@ -1,6 +1,7 @@
 use std::ffi::CString;
+use std::time::Duration;
 
-use pcsc::{Context, MAX_BUFFER_SIZE, Protocols, Scope, ShareMode};
+use pcsc::{Context, MAX_BUFFER_SIZE, Protocols, Scope, ShareMode, State};
 use smartcard_apdu::{ApduError, CommandApdu, ResponseApdu};
 use smartcard_core::{CardSession, ReaderInfo, Result, SmartcardError, Transport};
 
@@ -22,9 +23,25 @@ impl PcscTransport {
 impl Transport for PcscTransport {
     fn list_readers(&self) -> Result<Vec<ReaderInfo>> {
         let readers = self.context.list_readers_owned().map_err(map_pcsc_error)?;
+        if readers.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut states: Vec<pcsc::ReaderState> = readers
+            .iter()
+            .map(|reader| pcsc::ReaderState::new(reader.clone(), State::UNAWARE))
+            .collect();
+        self.context
+            .get_status_change(Duration::ZERO, &mut states)
+            .map_err(map_pcsc_error)?;
+
         Ok(readers
             .into_iter()
-            .map(|reader| ReaderInfo::new(reader.to_string_lossy().into_owned()))
+            .zip(states)
+            .map(|(reader, state)| {
+                ReaderInfo::new(reader.to_string_lossy().into_owned())
+                    .with_card_present(state.event_state().contains(State::PRESENT))
+            })
             .collect())
     }
 

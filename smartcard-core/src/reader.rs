@@ -22,6 +22,7 @@ impl ReaderHealth {
 pub struct ReaderInfo {
     pub name: String,
     pub atr: Option<Vec<u8>>,
+    pub card_present: bool,
     pub health: ReaderHealth,
 }
 
@@ -30,12 +31,18 @@ impl ReaderInfo {
         Self {
             name: name.into(),
             atr: None,
+            card_present: false,
             health: ReaderHealth::Healthy,
         }
     }
 
     pub fn with_atr(mut self, atr: Vec<u8>) -> Self {
         self.atr = Some(atr);
+        self
+    }
+
+    pub fn with_card_present(mut self, card_present: bool) -> Self {
+        self.card_present = card_present;
         self
     }
 

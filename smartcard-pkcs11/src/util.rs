@@ -13,7 +13,6 @@ use sha2::{Digest, Sha256};
 use smartcard_core::{SmartcardError, SmartcardRuntime};
 use smartcard_piv::{CertificateSlot, PRIMARY_CERTIFICATE_SLOTS, PivError, SignAlgorithm};
 use smartcard_worker::ReaderWorker;
-use x509_parser::oid_registry::OID_X509_SERIALNUMBER;
 use x509_parser::pem::Pem;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use x509_parser::public_key::PublicKey;
@@ -86,6 +85,7 @@ pub(crate) fn derive_token_metadata(
     select_label: Option<&str>,
     atr: &[u8],
     reader_name: &str,
+    card_serial: Option<&[u8]>,
 ) -> TokenMetadata {
     let label = certificates
         .iter()
@@ -104,15 +104,9 @@ pub(crate) fn derive_token_metadata(
         })
         .unwrap_or_else(|| "PIV Token".to_owned());
 
-    let serial_number = certificates
-        .iter()
-        .find(|(slot, _)| slot.key_reference == 0x9E)
-        .and_then(|(_, der)| certificate_subject_serial_number(der))
-        .or_else(|| {
-            certificates
-                .iter()
-                .find_map(|(_, der)| certificate_subject_serial_number(der))
-        })
+    let serial_number = card_serial
+        .filter(|serial| !serial.is_empty())
+        .map(pkcs11_serial)
         .unwrap_or_else(|| token_serial(atr, reader_name));
 
     TokenMetadata {
@@ -137,32 +131,10 @@ fn certificate_common_name(der: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn certificate_subject_serial_number(der: &[u8]) -> Option<String> {
-    let (_, parsed) = X509Certificate::from_der(der).ok()?;
-    let value = parsed
-        .subject()
-        .iter_by_oid(&OID_X509_SERIALNUMBER)
-        .find_map(|attribute| attribute.as_str().ok())?;
-    normalize_token_identifier(value)
-}
-
-fn normalize_token_identifier(value: &str) -> Option<String> {
-    let mut normalized: String = value
-        .chars()
-        .filter(|character| character.is_ascii_hexdigit())
-        .collect();
-    if normalized.is_empty() {
-        normalized = value
-            .chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .collect();
-    }
-    if normalized.is_empty() {
-        return None;
-    }
-    normalized.make_ascii_lowercase();
-    normalized.truncate(16);
-    Some(normalized)
+fn pkcs11_serial(serial: &[u8]) -> String {
+    let hex = hex_upper(serial).to_ascii_lowercase();
+    let start = hex.len().saturating_sub(16);
+    hex[start..].to_owned()
 }
 
 fn hex_upper(bytes: &[u8]) -> String {
@@ -751,8 +723,7 @@ pub(crate) fn map_smartcard_error(error: SmartcardError) -> CkRv {
 
 pub(crate) fn map_piv_error(error: PivError) -> CkRv {
     match error {
-        PivError::EmptyPin => CKR_PIN_INVALID,
-        PivError::PinTooLong(_) => CKR_PIN_LEN_RANGE,
+        PivError::PinLengthOutOfRange { .. } => CKR_PIN_LEN_RANGE,
         PivError::NonAsciiPin => CKR_PIN_INVALID,
         PivError::InvalidDigestLength { .. } => CKR_DATA_LEN_RANGE,
         PivError::UnsupportedSigningAlgorithm(_) => CKR_MECHANISM_INVALID,

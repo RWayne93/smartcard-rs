@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use smartcard_apdu::{CommandApdu, ResponseApdu, bytes_to_hex, hex_to_bytes};
-use smartcard_core::{RuntimeConfig, SmartcardRuntime};
+use smartcard_core::{ReaderInfo, RuntimeConfig, SmartcardRuntime};
 use smartcard_pcsc::PcscTransport;
 use smartcard_piv::{
     CertificateObject, CertificateSlot, PRIMARY_CERTIFICATE_SLOTS, SelectResponse,
@@ -39,18 +39,21 @@ fn run() -> Result<(), String> {
     let transport = PcscTransport::establish_user().map_err(|error| error.to_string())?;
     let runtime = SmartcardRuntime::new(transport, RuntimeConfig::default());
 
+    let readers = runtime.list_readers().map_err(|error| error.to_string())?;
+    if matches!(command, CliCommand::Readers) {
+        print_reader_list(&readers);
+        return Ok(());
+    }
+
+    let selection = resolve_reader(&readers, command.reader_hint())?;
+    if selection.report {
+        eprintln!("Using reader with a card: {}", selection.name);
+    }
+    let reader = selection.name;
+
     match command {
-        CliCommand::Readers => {
-            let readers = runtime.list_readers().map_err(|error| error.to_string())?;
-            if readers.is_empty() {
-                println!("No PC/SC readers found.");
-            } else {
-                for reader in readers {
-                    println!("{}", reader.name);
-                }
-            }
-        }
-        CliCommand::Atr { reader, timeout } => {
+        CliCommand::Readers => unreachable!("readers already returned"),
+        CliCommand::Atr { timeout, .. } => {
             let worker = open_worker(&runtime, reader, timeout)?;
             let snapshot = worker.snapshot();
             match snapshot.atr {
@@ -59,9 +62,7 @@ fn run() -> Result<(), String> {
             }
         }
         CliCommand::Apdu {
-            reader,
-            command,
-            timeout,
+            command, timeout, ..
         } => {
             let apdu = CommandApdu::from_hex(&command).map_err(|error| error.to_string())?;
             let worker = open_worker(&runtime, reader, timeout)?;
@@ -70,7 +71,7 @@ fn run() -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             print_response(&response);
         }
-        CliCommand::PivSelect { reader, timeout } => {
+        CliCommand::PivSelect { timeout, .. } => {
             let worker = open_worker(&runtime, reader, timeout)?;
             let response = runtime
                 .exchange(select_piv_application(), |command| worker.transmit(command))
@@ -80,7 +81,7 @@ fn run() -> Result<(), String> {
                 parse_select_response(&response.data).map_err(|error| error.to_string())?;
             print_piv_select_response(&parsed);
         }
-        CliCommand::PivCerts { reader, timeout } => {
+        CliCommand::PivCerts { timeout, .. } => {
             let worker = open_worker(&runtime, reader, timeout)?;
             let select_response = runtime
                 .exchange(select_piv_application(), |command| worker.transmit(command))
@@ -107,22 +108,18 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        CliCommand::PivVerifyPin {
-            reader,
-            pin,
-            timeout,
-        } => {
+        CliCommand::PivVerifyPin { pin, timeout, .. } => {
             let worker = open_worker(&runtime, reader, timeout)?;
             ensure_piv_selected(&runtime, &worker)?;
             verify_pin(&runtime, &worker, &pin)?;
             println!("PIN verified");
         }
         CliCommand::PivSign {
-            reader,
             slot,
             pin,
             hash_hex,
             timeout,
+            ..
         } => {
             let worker = open_worker(&runtime, reader, timeout)?;
             let digest = hex_to_bytes(&hash_hex).map_err(|error| error.to_string())?;
@@ -132,11 +129,11 @@ fn run() -> Result<(), String> {
             println!("signature: {}", bytes_to_hex(&signature));
         }
         CliCommand::PivSignVerify {
-            reader,
             slot,
             pin,
             hash_hex,
             timeout,
+            ..
         } => {
             let worker = open_worker(&runtime, reader, timeout)?;
             let digest = hex_to_bytes(&hash_hex).map_err(|error| error.to_string())?;
@@ -150,11 +147,11 @@ fn run() -> Result<(), String> {
             println!("verified: yes");
         }
         CliCommand::PivSignFile {
-            reader,
             slot,
             pin,
             file,
             timeout,
+            ..
         } => {
             let worker = open_worker(&runtime, reader, timeout)?;
             let digest = sha256_digest_file(&file)?;
@@ -186,6 +183,86 @@ fn open_worker(
         runtime.config().slow_call_threshold,
     )
     .map_err(|error| error.to_string())
+}
+
+fn print_reader_list(readers: &[ReaderInfo]) {
+    if readers.is_empty() {
+        println!("No PC/SC readers found.");
+        return;
+    }
+
+    for (index, reader) in readers.iter().enumerate() {
+        let presence = if reader.card_present { "card" } else { "empty" };
+        println!("{index} {presence} {}", reader.name);
+    }
+}
+
+#[derive(Debug)]
+struct ReaderSelection {
+    name: String,
+    report: bool,
+}
+
+fn resolve_reader(readers: &[ReaderInfo], hint: Option<&str>) -> Result<ReaderSelection, String> {
+    let Some(hint) = hint else {
+        let reader = readers
+            .iter()
+            .find(|reader| reader.card_present)
+            .ok_or_else(|| {
+                if readers.is_empty() {
+                    "No PC/SC readers found.".to_owned()
+                } else {
+                    "No card is present.".to_owned()
+                }
+            })?;
+        return Ok(ReaderSelection {
+            name: reader.name.clone(),
+            report: true,
+        });
+    };
+
+    if let Some(reader) = readers.iter().find(|reader| reader.name == hint) {
+        return Ok(ReaderSelection {
+            name: reader.name.clone(),
+            report: false,
+        });
+    }
+
+    if hint.chars().all(|character| character.is_ascii_digit())
+        && let Ok(index) = hint.parse::<usize>()
+    {
+        let reader = readers.get(index).ok_or_else(|| {
+            format!(
+                "reader index {index} is out of range ({} readers)",
+                readers.len()
+            )
+        })?;
+        return Ok(ReaderSelection {
+            name: reader.name.clone(),
+            report: true,
+        });
+    }
+
+    let needle = hint.to_ascii_lowercase();
+    let matches: Vec<&ReaderInfo> = readers
+        .iter()
+        .filter(|reader| reader.name.to_ascii_lowercase().contains(&needle))
+        .collect();
+    match matches.as_slice() {
+        [reader] => Ok(ReaderSelection {
+            name: reader.name.clone(),
+            report: true,
+        }),
+        [] => Err(format!("reader {hint:?} not found")),
+        matches => {
+            let mut message = format!("reader {hint:?} matches multiple readers:");
+            for reader in matches {
+                message.push('\n');
+                message.push_str(&reader.name);
+            }
+            Err(message)
+        }
+    }
 }
 
 fn print_response(response: &ResponseApdu) {
@@ -423,43 +500,43 @@ fn parse_command(args: &[String]) -> Result<CliCommand, String> {
     match command {
         "readers" => Ok(CliCommand::Readers),
         "atr" => Ok(CliCommand::Atr {
-            reader: reader.ok_or_else(|| "atr requires --reader".to_owned())?,
+            reader,
             timeout: timeout_ms.unwrap_or(Duration::from_millis(1_500)),
         }),
         "apdu" => Ok(CliCommand::Apdu {
-            reader: reader.ok_or_else(|| "apdu requires --reader".to_owned())?,
+            reader,
             command: apdu.ok_or_else(|| "apdu requires --command".to_owned())?,
             timeout: timeout_ms.unwrap_or(Duration::from_millis(1_500)),
         }),
         "piv-select" => Ok(CliCommand::PivSelect {
-            reader: reader.ok_or_else(|| "piv-select requires --reader".to_owned())?,
+            reader,
             timeout: timeout_ms.unwrap_or(Duration::from_millis(1_500)),
         }),
         "piv-certs" => Ok(CliCommand::PivCerts {
-            reader: reader.ok_or_else(|| "piv-certs requires --reader".to_owned())?,
+            reader,
             timeout: timeout_ms.unwrap_or(Duration::from_millis(1_500)),
         }),
         "piv-verify-pin" => Ok(CliCommand::PivVerifyPin {
-            reader: reader.ok_or_else(|| "piv-verify-pin requires --reader".to_owned())?,
+            reader,
             pin: resolve_pin(pin, pin_env)?,
             timeout: timeout_ms.unwrap_or(Duration::from_millis(1_500)),
         }),
         "piv-sign" => Ok(CliCommand::PivSign {
-            reader: reader.ok_or_else(|| "piv-sign requires --reader".to_owned())?,
+            reader,
             slot: slot.ok_or_else(|| "piv-sign requires --slot".to_owned())?,
             pin: resolve_pin(pin, pin_env)?,
             hash_hex: hash_hex.ok_or_else(|| "piv-sign requires --hash-hex".to_owned())?,
             timeout: timeout_ms.unwrap_or(Duration::from_millis(1_500)),
         }),
         "piv-sign-verify" => Ok(CliCommand::PivSignVerify {
-            reader: reader.ok_or_else(|| "piv-sign-verify requires --reader".to_owned())?,
+            reader,
             slot: slot.ok_or_else(|| "piv-sign-verify requires --slot".to_owned())?,
             pin: resolve_pin(pin, pin_env)?,
             hash_hex: hash_hex.ok_or_else(|| "piv-sign-verify requires --hash-hex".to_owned())?,
             timeout: timeout_ms.unwrap_or(Duration::from_millis(1_500)),
         }),
         "piv-sign-file" => Ok(CliCommand::PivSignFile {
-            reader: reader.ok_or_else(|| "piv-sign-file requires --reader".to_owned())?,
+            reader,
             slot: slot.ok_or_else(|| "piv-sign-file requires --slot".to_owned())?,
             pin: resolve_pin(pin, pin_env)?,
             file: file.ok_or_else(|| "piv-sign-file requires --file".to_owned())?,
@@ -504,67 +581,163 @@ fn parse_slot(value: &str) -> Result<CertificateSlot, String> {
 
 fn print_usage() {
     println!("smartcard-cli readers");
-    println!("smartcard-cli atr --reader <name> [--timeout-ms <ms>]");
-    println!("smartcard-cli apdu --reader <name> --command <hex> [--timeout-ms <ms>]");
-    println!("smartcard-cli piv-select --reader <name> [--timeout-ms <ms>]");
-    println!("smartcard-cli piv-certs --reader <name> [--timeout-ms <ms>]");
+    println!("smartcard-cli atr [--reader <name>] [--timeout-ms <ms>]");
+    println!("smartcard-cli apdu --command <hex> [--reader <name>] [--timeout-ms <ms>]");
+    println!("smartcard-cli piv-select [--reader <name>] [--timeout-ms <ms>]");
+    println!("smartcard-cli piv-certs [--reader <name>] [--timeout-ms <ms>]");
     println!(
-        "smartcard-cli piv-verify-pin --reader <name> (--pin <pin> | --pin-env <env>) [--timeout-ms <ms>]"
+        "smartcard-cli piv-verify-pin (--pin <pin> | --pin-env <env>) [--reader <name>] [--timeout-ms <ms>]"
     );
     println!(
-        "smartcard-cli piv-sign --reader <name> --slot <9A|9C|9D|9E> --hash-hex <sha256> (--pin <pin> | --pin-env <env>) [--timeout-ms <ms>]"
+        "smartcard-cli piv-sign --slot <9A|9C|9D|9E> --hash-hex <sha256> (--pin <pin> | --pin-env <env>) [--reader <name>] [--timeout-ms <ms>]"
     );
     println!(
-        "smartcard-cli piv-sign-verify --reader <name> --slot <9A|9C|9D|9E> --hash-hex <sha256> (--pin <pin> | --pin-env <env>) [--timeout-ms <ms>]"
+        "smartcard-cli piv-sign-verify --slot <9A|9C|9D|9E> --hash-hex <sha256> (--pin <pin> | --pin-env <env>) [--reader <name>] [--timeout-ms <ms>]"
     );
     println!(
-        "smartcard-cli piv-sign-file --reader <name> --slot <9A|9C|9D|9E> --file <path> (--pin <pin> | --pin-env <env>) [--timeout-ms <ms>]"
+        "smartcard-cli piv-sign-file --slot <9A|9C|9D|9E> --file <path> (--pin <pin> | --pin-env <env>) [--reader <name>] [--timeout-ms <ms>]"
     );
 }
 
 enum CliCommand {
     Readers,
     Atr {
-        reader: String,
+        reader: Option<String>,
         timeout: Duration,
     },
     Apdu {
-        reader: String,
+        reader: Option<String>,
         command: String,
         timeout: Duration,
     },
     PivSelect {
-        reader: String,
+        reader: Option<String>,
         timeout: Duration,
     },
     PivCerts {
-        reader: String,
+        reader: Option<String>,
         timeout: Duration,
     },
     PivVerifyPin {
-        reader: String,
+        reader: Option<String>,
         pin: String,
         timeout: Duration,
     },
     PivSign {
-        reader: String,
+        reader: Option<String>,
         slot: CertificateSlot,
         pin: String,
         hash_hex: String,
         timeout: Duration,
     },
     PivSignVerify {
-        reader: String,
+        reader: Option<String>,
         slot: CertificateSlot,
         pin: String,
         hash_hex: String,
         timeout: Duration,
     },
     PivSignFile {
-        reader: String,
+        reader: Option<String>,
         slot: CertificateSlot,
         pin: String,
         file: PathBuf,
         timeout: Duration,
     },
+}
+
+impl CliCommand {
+    fn reader_hint(&self) -> Option<&str> {
+        match self {
+            Self::Readers => None,
+            Self::Atr { reader, .. }
+            | Self::Apdu { reader, .. }
+            | Self::PivSelect { reader, .. }
+            | Self::PivCerts { reader, .. }
+            | Self::PivVerifyPin { reader, .. }
+            | Self::PivSign { reader, .. }
+            | Self::PivSignVerify { reader, .. }
+            | Self::PivSignFile { reader, .. } => reader.as_deref(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_reader;
+    use smartcard_core::ReaderInfo;
+
+    fn reader(name: &str, card_present: bool) -> ReaderInfo {
+        ReaderInfo::new(name).with_card_present(card_present)
+    }
+
+    #[test]
+    fn defaults_to_the_first_reader_with_a_card() {
+        let readers = vec![
+            reader("empty slot", false),
+            reader("Broadcom contact", true),
+            reader("second card", true),
+        ];
+
+        let selection = resolve_reader(&readers, None).unwrap();
+        assert_eq!(selection.name, "Broadcom contact");
+        assert!(selection.report);
+    }
+
+    #[test]
+    fn reports_when_no_card_is_present() {
+        let readers = vec![reader("empty slot", false)];
+        let error = resolve_reader(&readers, None).unwrap_err();
+        assert_eq!(error, "No card is present.");
+    }
+
+    #[test]
+    fn reports_when_no_readers_exist() {
+        let error = resolve_reader(&[], None).unwrap_err();
+        assert_eq!(error, "No PC/SC readers found.");
+    }
+
+    #[test]
+    fn matches_an_exact_name_without_announcing_it() {
+        let readers = vec![reader("Broadcom contact", true)];
+        let selection = resolve_reader(&readers, Some("Broadcom contact")).unwrap();
+        assert_eq!(selection.name, "Broadcom contact");
+        assert!(!selection.report);
+    }
+
+    #[test]
+    fn matches_a_unique_substring() {
+        let readers = vec![
+            reader(
+                "Broadcom Corp 58200 [Contacted SmartCard] (0123456789ABCD) 00 00",
+                true,
+            ),
+            reader(
+                "Broadcom Corp 58200 [Contactless SmartCard] (0123456789ABCD) 01 00",
+                false,
+            ),
+        ];
+
+        let selection = resolve_reader(&readers, Some("contacted")).unwrap();
+        assert!(selection.name.contains("Contacted"));
+        assert!(selection.report);
+    }
+
+    #[test]
+    fn matches_a_reader_index() {
+        let readers = vec![reader("first", false), reader("second", true)];
+        let selection = resolve_reader(&readers, Some("1")).unwrap();
+        assert_eq!(selection.name, "second");
+        assert!(selection.report);
+    }
+
+    #[test]
+    fn rejects_an_ambiguous_substring() {
+        let readers = vec![
+            reader("Broadcom contact", true),
+            reader("Broadcom contactless", false),
+        ];
+        let error = resolve_reader(&readers, Some("broadcom")).unwrap_err();
+        assert!(error.contains("matches multiple readers"));
+    }
 }

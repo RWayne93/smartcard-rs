@@ -135,8 +135,62 @@ pub fn get_data_command(tag: &[u8]) -> CommandApdu {
     CommandApdu::new(0x00, 0xCB, 0x3F, 0xFF, data, Some(0x00))
 }
 
+pub const CHUID_OBJECT_ID: [u8; 3] = [0x5F, 0xC1, 0x02];
+
 pub fn read_certificate_command(slot: CertificateSlot) -> CommandApdu {
     get_data_command(&slot.object_id)
+}
+
+pub fn read_chuid_command() -> CommandApdu {
+    get_data_command(&CHUID_OBJECT_ID)
+}
+
+/// Card serial from the CHUID, using the same choice as OpenSC: the 25-byte
+/// FASC-N, or the 16-byte GUID when the FASC-N agency code is 9999.
+pub fn parse_chuid_serial(response: &ResponseApdu) -> Result<Option<Vec<u8>>, PivError> {
+    match response.status_word() {
+        0x9000 => {}
+        0x6A82 => return Ok(None),
+        status => {
+            return Err(PivError::UnexpectedStatusWord {
+                operation: "GET DATA CHUID",
+                status,
+            });
+        }
+    }
+
+    let outer = parse_tlv_all(&response.data).map_err(PivError::MalformedTlv)?;
+    let Some(container) = outer.iter().find(|tlv| tlv.tag_eq(&[0x53])) else {
+        return Ok(None);
+    };
+    let records = parse_tlv_all(&container.value).map_err(PivError::MalformedTlv)?;
+    let fascn = records
+        .iter()
+        .find(|record| record.tag_eq(&[0x30]) && record.value.len() == 25)
+        .map(|record| record.value.as_slice());
+    let guid = records
+        .iter()
+        .find(|record| record.tag_eq(&[0x34]) && record.value.len() == 16)
+        .map(|record| record.value.as_slice());
+    let guid_present = guid.is_some_and(|guid| guid.iter().any(|byte| *byte != 0));
+
+    if let Some(fascn) = fascn
+        && !(guid_present && fascn_agency_code_is_9999(fascn))
+    {
+        return Ok(Some(fascn.to_vec()));
+    }
+    if let Some(guid) = guid.filter(|_| guid_present) {
+        return Ok(Some(guid.to_vec()));
+    }
+    Ok(None)
+}
+
+fn fascn_agency_code_is_9999(fascn: &[u8]) -> bool {
+    fascn.len() == 25
+        && fascn[0] == 0xD4
+        && fascn[1] == 0xE7
+        && fascn[2] == 0x39
+        && (fascn[3] | 0x7F) == 0xFF
 }
 
 pub fn parse_select_response(data: &[u8]) -> Result<SelectResponse, PivError> {
@@ -444,13 +498,16 @@ pub fn verify_signature_sha256(
     }
 }
 
-pub fn verify_pin_command(pin: &str) -> Result<CommandApdu, PivError> {
-    if pin.is_empty() {
-        return Err(PivError::EmptyPin);
-    }
+pub const PIV_PIN_MIN_LENGTH: usize = 6;
+pub const PIV_PIN_MAX_LENGTH: usize = 8;
 
-    if pin.len() > 8 {
-        return Err(PivError::PinTooLong(pin.len()));
+pub fn verify_pin_command(pin: &str) -> Result<CommandApdu, PivError> {
+    if !(PIV_PIN_MIN_LENGTH..=PIV_PIN_MAX_LENGTH).contains(&pin.len()) {
+        return Err(PivError::PinLengthOutOfRange {
+            length: pin.len(),
+            min: PIV_PIN_MIN_LENGTH,
+            max: PIV_PIN_MAX_LENGTH,
+        });
     }
 
     if !pin.is_ascii() {
@@ -554,8 +611,11 @@ fn encode_ber_length(length: usize) -> Result<Vec<u8>, PivError> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PivError {
-    EmptyPin,
-    PinTooLong(usize),
+    PinLengthOutOfRange {
+        length: usize,
+        min: usize,
+        max: usize,
+    },
     NonAsciiPin,
     MissingDataObject(&'static str),
     InvalidDataObject(&'static str, &'static str),
@@ -581,8 +641,9 @@ pub enum PivError {
 impl fmt::Display for PivError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyPin => write!(f, "PIN must not be empty"),
-            Self::PinTooLong(length) => write!(f, "PIN must be 8 bytes or fewer, got {length}"),
+            Self::PinLengthOutOfRange { length, min, max } => {
+                write!(f, "PIN length must be {min} to {max} bytes, got {length}")
+            }
             Self::NonAsciiPin => write!(f, "PIN must be ASCII"),
             Self::MissingDataObject(tag) => write!(f, "missing required data object {tag}"),
             Self::InvalidDataObject(tag, reason) => {
@@ -630,15 +691,29 @@ mod tests {
     use smartcard_apdu::{ResponseApdu, hex_to_bytes};
 
     use super::{
-        PIV_AID, PRIMARY_CERTIFICATE_SLOTS, SignAlgorithm, VerifyPinStatus, build_sign_commands,
-        parse_certificate_response, parse_select_response, parse_sign_response, parse_tlv_all,
-        parse_verify_pin_response, prepare_signing_input_sha256, read_certificate_command,
+        PIV_AID, PRIMARY_CERTIFICATE_SLOTS, PivError, SignAlgorithm, VerifyPinStatus,
+        build_sign_commands, parse_certificate_response, parse_chuid_serial, parse_select_response,
+        parse_sign_response, parse_tlv_all, parse_verify_pin_response,
+        prepare_signing_input_sha256, read_certificate_command, read_chuid_command,
         verify_pin_command, verify_signature_sha256,
     };
 
     #[test]
     fn piv_aid_has_expected_length() {
         assert_eq!(PIV_AID.len(), 11);
+    }
+
+    #[test]
+    fn pin_shorter_than_six_bytes_is_rejected() {
+        let error = verify_pin_command("12345").expect_err("short PIN should be rejected");
+        assert!(matches!(
+            error,
+            PivError::PinLengthOutOfRange {
+                length: 5,
+                min: 6,
+                max: 8
+            }
+        ));
     }
 
     #[test]
@@ -690,6 +765,73 @@ mod tests {
         let command = read_certificate_command(PRIMARY_CERTIFICATE_SLOTS[0]);
         let encoded = command.encode().expect("command should encode");
         assert_eq!(encoded, hex_to_bytes("00CB3FFF055C035FC10500").unwrap());
+    }
+
+    #[test]
+    fn read_chuid_command_uses_the_chuid_object_id() {
+        let encoded = read_chuid_command()
+            .encode()
+            .expect("command should encode");
+        assert_eq!(encoded, hex_to_bytes("00CB3FFF055C035FC10200").unwrap());
+    }
+
+    #[test]
+    fn chuid_with_agency_code_9999_uses_the_guid() {
+        let mut fascn = vec![0x00; 25];
+        fascn[..4].copy_from_slice(&[0xD4, 0xE7, 0x39, 0xFF]);
+        let response = chuid_response(
+            &fascn,
+            &hex_to_bytes("c666f679dd714cea8a86a282201093fc").unwrap(),
+        );
+
+        let serial = parse_chuid_serial(&response)
+            .expect("CHUID should parse")
+            .expect("GUID should be present");
+        assert_eq!(
+            serial,
+            hex_to_bytes("c666f679dd714cea8a86a282201093fc").unwrap()
+        );
+    }
+
+    #[test]
+    fn chuid_with_a_real_fascn_uses_the_fascn() {
+        let mut fascn = vec![0x00; 25];
+        fascn[24] = 0xAB;
+        let response = chuid_response(
+            &fascn,
+            &hex_to_bytes("c666f679dd714cea8a86a282201093fc").unwrap(),
+        );
+
+        let serial = parse_chuid_serial(&response)
+            .expect("CHUID should parse")
+            .expect("FASC-N should be present");
+        assert_eq!(serial, fascn);
+    }
+
+    #[test]
+    fn missing_chuid_returns_none() {
+        let response =
+            ResponseApdu::from_bytes(&hex_to_bytes("6A82").unwrap()).expect("status should parse");
+        let serial = parse_chuid_serial(&response).expect("missing CHUID is not fatal");
+        assert!(serial.is_none());
+    }
+
+    fn chuid_response(fascn: &[u8], guid: &[u8]) -> ResponseApdu {
+        let mut body = Vec::new();
+        body.push(0x30);
+        body.push(fascn.len() as u8);
+        body.extend_from_slice(fascn);
+        body.push(0x34);
+        body.push(guid.len() as u8);
+        body.extend_from_slice(guid);
+        body.extend_from_slice(&[0xFE, 0x00]);
+
+        let mut data = Vec::new();
+        data.push(0x53);
+        data.push(body.len() as u8);
+        data.extend_from_slice(&body);
+        data.extend_from_slice(&[0x90, 0x00]);
+        ResponseApdu::from_bytes(&data).expect("response bytes should parse")
     }
 
     #[test]

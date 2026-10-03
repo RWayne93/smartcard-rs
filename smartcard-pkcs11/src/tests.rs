@@ -44,12 +44,21 @@ fn derive_token_metadata_prefers_certificate_identity_over_applet_identity() {
         Some("HID Global ActivID Applet 2.7.4"),
         &[0x3B, 0xD8, 0x18, 0x00, 0x80, 0x1F, 0x07, 0x80],
         "Reader A",
+        None,
     );
 
     assert_eq!(metadata.label, "test-piv");
     assert_eq!(metadata.manufacturer, "piv_II");
     assert_eq!(metadata.model, "PKCS#15 emulated");
     assert_eq!(metadata.serial_number, "3BD81800801F0780");
+}
+
+#[test]
+fn derive_token_metadata_publishes_the_last_16_hex_digits_of_the_chuid_guid() {
+    let guid = hex_to_bytes("c666f679dd714cea8a86a282201093fc").unwrap();
+    let metadata = derive_token_metadata(&[], None, &[], "Reader A", Some(&guid));
+
+    assert_eq!(metadata.serial_number, "8a86a282201093fc");
 }
 
 fn sample_certificate_der() -> Vec<u8> {

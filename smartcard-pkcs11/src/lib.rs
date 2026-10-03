@@ -17,10 +17,11 @@ use sha2::{Digest, Sha256};
 use smartcard_core::{RuntimeConfig, SmartcardError, SmartcardRuntime};
 use smartcard_pcsc::PcscTransport;
 use smartcard_piv::{
-    CertificateSlot, PRIMARY_CERTIFICATE_SLOTS, SignAlgorithm, VerifyPinStatus,
-    build_sign_commands, infer_sign_algorithm, parse_certificate_response, parse_select_response,
-    parse_sign_response, parse_verify_pin_response, prepare_signing_input_sha256,
-    read_certificate_command, select_piv_application, verify_pin_command,
+    CertificateSlot, PIV_PIN_MAX_LENGTH, PIV_PIN_MIN_LENGTH, PRIMARY_CERTIFICATE_SLOTS,
+    SignAlgorithm, VerifyPinStatus, build_sign_commands, infer_sign_algorithm,
+    parse_certificate_response, parse_chuid_serial, parse_select_response, parse_sign_response,
+    parse_verify_pin_response, prepare_signing_input_sha256, read_certificate_command,
+    read_chuid_command, select_piv_application, verify_pin_command,
 };
 use smartcard_worker::ReaderWorker;
 use util::*;
@@ -35,6 +36,13 @@ struct ModuleState {
     workers: HashMap<String, ReaderWorker>,
     last_reader_refresh: Option<Instant>,
     last_token_refreshes: HashMap<SlotId, Instant>,
+}
+
+fn read_card_serial(runtime: &SmartcardRuntime, worker: &ReaderWorker) -> Option<Vec<u8>> {
+    let response = runtime
+        .exchange(read_chuid_command(), |command| worker.transmit(command))
+        .ok()?;
+    parse_chuid_serial(&response).ok().flatten()
 }
 
 impl ModuleState {
@@ -257,11 +265,13 @@ impl ModuleState {
             select.label.as_deref().unwrap_or("PIV Token"),
             objects.len()
         ));
+        let card_serial = read_card_serial(&runtime, worker);
         let token_metadata = derive_token_metadata(
             &token_certificates,
             select.label.as_deref(),
             &atr,
             reader_name,
+            card_serial.as_deref(),
         );
         Ok(Some((
             TokenTemplate {
@@ -805,8 +815,8 @@ pub unsafe extern "C" fn C_GetTokenInfo(slot_id: CkSlotId, info: *mut CkTokenInf
             ul_session_count: session_count,
             ul_max_rw_session_count: CK_UNAVAILABLE_INFORMATION,
             ul_rw_session_count: 0,
-            ul_max_pin_len: 8,
-            ul_min_pin_len: 1,
+            ul_max_pin_len: PIV_PIN_MAX_LENGTH as CkUlong,
+            ul_min_pin_len: PIV_PIN_MIN_LENGTH as CkUlong,
             ul_total_public_memory: CK_UNAVAILABLE_INFORMATION,
             ul_free_public_memory: CK_UNAVAILABLE_INFORMATION,
             ul_total_private_memory: CK_UNAVAILABLE_INFORMATION,
